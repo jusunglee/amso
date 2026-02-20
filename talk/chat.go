@@ -1,7 +1,12 @@
 // Package talk provides a high-level KakaoTalk client built on the LOCO protocol.
 package talk
 
-import "go.mongodb.org/mongo-driver/bson"
+import (
+	"encoding/json"
+	"fmt"
+
+	"go.mongodb.org/mongo-driver/bson"
+)
 
 // ChatType constants for KakaoTalk message types.
 const (
@@ -44,4 +49,51 @@ func ParseChatlog(raw bson.Raw) (*Chatlog, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// PhotoAttachment represents attachment data for photo messages (type=2).
+type PhotoAttachment struct {
+	Path   string `json:"path"`
+	URL    string `json:"url,omitempty"`
+	Width  int    `json:"w"`
+	Height int    `json:"h"`
+	Size   int64  `json:"s"`
+	Key    string `json:"k,omitempty"`
+	Name   string `json:"name,omitempty"`
+}
+
+// FileAttachment represents attachment data for file messages (type=18).
+type FileAttachment struct {
+	Path   string `json:"path"`
+	Name   string `json:"name"`
+	Size   int64  `json:"s"`
+	Key    string `json:"k,omitempty"`
+	Expire int64  `json:"expire,omitempty"`
+}
+
+// ParsePhotoAttachment parses a PhotoAttachment from a Chatlog's Attachment field.
+// KakaoTalk stores attachments as JSON strings inside the BSON body.
+func ParsePhotoAttachment(raw bson.Raw) (*PhotoAttachment, error) {
+	var att PhotoAttachment
+	// Try JSON string first (common encoding)
+	if err := json.Unmarshal([]byte(raw), &att); err == nil && att.Path != "" {
+		return &att, nil
+	}
+	// Fall back to BSON document
+	if err := bson.Unmarshal(raw, &att); err != nil {
+		return nil, fmt.Errorf("talk: parse photo attachment: %w", err)
+	}
+	return &att, nil
+}
+
+// ParseFileAttachment parses a FileAttachment from a Chatlog's Attachment field.
+func ParseFileAttachment(raw bson.Raw) (*FileAttachment, error) {
+	var att FileAttachment
+	if err := json.Unmarshal([]byte(raw), &att); err == nil && att.Path != "" {
+		return &att, nil
+	}
+	if err := bson.Unmarshal(raw, &att); err != nil {
+		return nil, fmt.Errorf("talk: parse file attachment: %w", err)
+	}
+	return &att, nil
 }

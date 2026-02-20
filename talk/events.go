@@ -43,6 +43,31 @@ type ChannelLeaveEvent struct {
 
 func (ChannelLeaveEvent) EventType() string { return "DELMEM" }
 
+// ReadReceiptEvent is fired when someone reads messages in a channel.
+type ReadReceiptEvent struct {
+	ChannelID int64
+	UserID    int64
+	Watermark int64 // logId up to which messages have been read
+}
+
+func (ReadReceiptEvent) EventType() string { return "NOTIREAD" }
+
+// TypingEvent is fired when someone starts typing in a channel.
+type TypingEvent struct {
+	ChannelID int64
+	UserID    int64
+}
+
+func (TypingEvent) EventType() string { return "TYPING" }
+
+// MessageDeleteEvent is fired when a message is deleted in a channel.
+type MessageDeleteEvent struct {
+	ChannelID int64
+	LogID     int64
+}
+
+func (MessageDeleteEvent) EventType() string { return "DELETEMSG" }
+
 // EventHandlers holds callbacks for each event type.
 type EventHandlers struct {
 	OnMessage       func(MessageEvent)
@@ -50,5 +75,8 @@ type EventHandlers struct {
 	OnDisconnect    func(DisconnectEvent)
 	OnChannelJoin   func(ChannelJoinEvent)
 	OnChannelLeave  func(ChannelLeaveEvent)
+	OnReadReceipt   func(ReadReceiptEvent)
+	OnTyping        func(TypingEvent)
+	OnMessageDelete func(MessageDeleteEvent)
 	OnRaw           func(method string, body []byte) // catch-all for unhandled push types
 }

@@ -458,6 +458,43 @@ amso/
 
 The core SDK is ~1,800 lines. The remaining ~1,900 lines are test commands and debug tools -- one-off programs we wrote along the way to poke at individual protocol steps, dump responses, and automate the emulator.
 
+## The MITM Dead End
+
+Before decompiling the APK, we tried the obvious approach: man-in-the-middle the KakaoTalk client to watch its traffic and learn the protocol by example.
+
+The plan was straightforward. Run [mitmproxy](https://mitmproxy.org/) on localhost, install its CA certificate as a trusted root, and route KakaoTalk's HTTPS traffic through it. We'd see every HTTP request -- the login endpoint, the headers, the exact form fields -- without guessing.
+
+```bash
+# Install mitmproxy CA as trusted root
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain \
+  ~/.mitmproxy/mitmproxy-ca-cert.pem
+
+# Start mitmdump, launch KakaoTalk through the proxy
+export https_proxy=http://127.0.0.1:8080
+open /Applications/KakaoTalk.app
+```
+
+KakaoTalk refused to connect. No requests appeared in mitmdump. The app uses **certificate pinning** -- it ships with a hardcoded copy of the expected server certificate (or its public key hash) and rejects any TLS connection where the certificate doesn't match, even if the system trusts the CA. Our mitmproxy CA cert was trusted by macOS, but KakaoTalk ignored that entirely.
+
+We tried the Android emulator next, with [Frida](https://frida.re/) -- a dynamic instrumentation toolkit that can inject JavaScript into running processes. The idea: hook into KakaoTalk's OkHttp client at runtime and bypass the certificate pinning checks.
+
+```javascript
+// Frida script: bypass OkHttp CertificatePinner
+var CertificatePinner = Java.use("okhttp3.CertificatePinner");
+CertificatePinner.check.overload("java.lang.String", "java.util.List")
+    .implementation = function(hostname, peerCertificates) {
+        console.log("[*] CertificatePinner.check bypassed for: " + hostname);
+        return;  // skip validation
+    };
+```
+
+This also failed. KakaoTalk uses ProGuard/R8 obfuscation, which renames classes and methods at compile time. The class `okhttp3.CertificatePinner` doesn't exist under that name in the APK -- it's been renamed to something like `kq.a` or `sr.b`. We tried enumerating all loaded classes matching `kakao` or `loco` patterns, but the sheer number of obfuscated classes made it impractical to find the right hooks.
+
+The Frida approach could theoretically work with enough effort -- map every obfuscated class, find the one that does certificate validation, hook it. But at that point, decompiling the APK with JADX and reading the (obfuscated but still comprehensible) Java source was faster and gave us everything we needed: the RSA key, the handshake type, the XVC seeds, the endpoint paths.
+
+The LOCO protocol itself (the encrypted TCP layer after login) wouldn't benefit from MITM anyway. It's a bespoke binary protocol with its own encryption -- not HTTP, not TLS. The only way to understand it is to read the code that implements it.
+
 ## What node-kakao Got Wrong (For Us)
 
 [node-kakao](https://github.com/storycraft/node-kakao) is the most complete open-source LOCO implementation. It gave us the protocol structure, the command names, the BSON field layouts. But it hasn't been actively maintained against recent KakaoTalk server changes, and several assumptions it makes are now wrong:
@@ -481,3 +518,51 @@ The RSA key rotation alone made every encrypted connection fail silently with EO
 **Automate the annoying parts.** We ran the passcode registration flow ~10 times during debugging. Without ADB automation, each attempt would've been 2-3 minutes of manual tapping through the KakaoTalk UI on the emulator. With it, the entire flow -- generate passcode, navigate to verification screen, type code, tap OK -- takes 8 seconds.
 
 **Tokens are ephemeral.** KakaoTalk access tokens expire within minutes, and each `forced` login consumes the device registration. A 5-minute debugging detour between getting a token and trying LOGINLIST means the token is dead and you need to start from the passcode flow. We learned to script the entire pipeline -- register, login, connect -- as one unbroken sequence.
+
+## Fixing the Registration Loop
+
+The biggest developer-experience problem during all of this was the **device registration loop**. Every call to `login.json` with `forced:true` consumed the device registration, which meant every test run required the full passcode-on-phone dance: generate passcode, switch to the emulator, navigate to the verification screen, enter the code, tap confirm, race back to the terminal before the token expired. During a debugging session, we'd burn through this cycle 5-10 times in an hour.
+
+The root cause was a single hardcoded boolean:
+
+```go
+Forced: true,
+```
+
+The `forced` flag tells the server "log me in even if another sub-device session exists." It's the sledgehammer approach -- it always works, but it invalidates the device's registration as a side effect. Without `forced`, the server checks whether the device is already registered and issues a token without consuming the registration. The device stays approved for future logins.
+
+We'd originally used `forced:true` everywhere because it was the only thing that worked during initial development -- before the device was registered at all, `forced:false` returns -100 (`NEED_DEVICE_AUTH`), and we kept it set to `true` out of cargo-cult habit even after registration succeeded.
+
+The fix was three changes:
+
+**1. New passcode endpoints.** The old form-encoded `request_passcode.json` and `register_device.json` endpoints had started returning -400 (deprecated). KakaoTalk had migrated to JSON-based `passcodeLogin/*` endpoints:
+
+```go
+// Old (broken):
+POST /mac/account/request_passcode.json  → -400
+POST /mac/account/register_device.json   → -400
+
+// New (working):
+POST /mac/account/passcodeLogin/cancel           → clear pending
+POST /mac/account/passcodeLogin/generate          → returns passcode
+POST /mac/account/passcodeLogin/registerDevice    → poll until confirmed
+```
+
+The new endpoints use JSON request bodies instead of form-encoded, but still require the same auth headers (A, X-VC, User-Agent). The `generate` endpoint returns a passcode that the user confirms on their phone, then `registerDevice` is polled until the server acknowledges the confirmation.
+
+**2. Default to `forced:false`.** The `Login()` method now defaults to `Forced: false`. A new `LoginWithOptions` method exposes the flag for callers who explicitly need it, with a doc comment warning that it burns the registration:
+
+```go
+type LoginOptions struct {
+    Forced bool // WARNING: burns device registration
+}
+
+func (c *Client) Login(email, password, deviceUUID, deviceName string) error {
+    return c.LoginWithOptions(email, password, deviceUUID, deviceName,
+        LoginOptions{Forced: false})
+}
+```
+
+**3. Token refresh doesn't burn registration.** The `RefreshSession()` fallback path -- which fires when a token refresh fails and the client needs to do a full re-login -- was calling `Login()` (which previously used `forced:true`). Now it explicitly passes `Forced: false`. If the device is still registered, the re-login succeeds silently. If not, the caller gets a clean -100 error and can run the passcode flow.
+
+The result: register the device once, then run test-flow as many times as you want without touching the phone. The access token from `login.json` with `forced:false` works just like one from `forced:true` -- same expiry, same permissions, same LOCO session behavior. The only difference is the device registration survives.

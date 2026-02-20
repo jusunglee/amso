@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -181,12 +182,166 @@ func (ac *AuthClient) post(api string, extra url.Values) ([]byte, error) {
 	return doAuthRequest(endpoint, form, ac.Agent, ac.Version, ac.OSVersion, ac.Language, ac.Email, ac.DeviceUUID)
 }
 
+func (ac *AuthClient) postJSON(api string, payload interface{}) ([]byte, error) {
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("auth: marshal json: %w", err)
+	}
+
+	userAgent := getUserAgent(ac.Agent, ac.Version, ac.OSVersion, ac.Language)
+	xvc := ComputeXVC(ac.Agent, userAgent, ac.Email, ac.DeviceUUID)
+
+	endpoint := fmt.Sprintf("%s/%s/account/%s", baseURL, ac.Agent, api)
+	httpReq, err := http.NewRequest("POST", endpoint, bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("A", fmt.Sprintf("%s/%s/%s", ac.Agent, ac.Version, ac.Language))
+	httpReq.Header.Set("X-VC", xvc)
+	httpReq.Header.Set("User-Agent", userAgent)
+	httpReq.Header.Set("Accept", "*/*")
+	httpReq.Header.Set("Accept-Language", ac.Language)
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+// PasscodeDeviceInfo contains device info for the passcode login flow.
+type PasscodeDeviceInfo struct {
+	Name      string `json:"name,omitempty"`
+	UUID      string `json:"uuid"`
+	OSVersion string `json:"osVersion,omitempty"`
+}
+
+// PasscodeGenerateResponse is the response from passcodeLogin/generate.
+type PasscodeGenerateResponse struct {
+	Status           int    `json:"status"`
+	Passcode         string `json:"passcode"`
+	RemainingSeconds int    `json:"remainingSeconds"`
+}
+
+// PasscodeRegisterResponse is the response from passcodeLogin/registerDevice.
+type PasscodeRegisterResponse struct {
+	Status                       int `json:"status"`
+	RemainingSeconds             int `json:"remainingSeconds"`
+	NextRequestIntervalInSeconds int `json:"nextRequestIntervalInSeconds"`
+}
+
+// CancelPasscode cancels any pending passcode login flow.
+func (ac *AuthClient) CancelPasscode() error {
+	body, err := ac.postJSON("passcodeLogin/cancel", map[string]interface{}{
+		"email":    ac.Email,
+		"password": ac.Password,
+		"device": PasscodeDeviceInfo{
+			UUID: ac.DeviceUUID,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("auth: cancel passcode: %w", err)
+	}
+
+	var result struct {
+		Status int `json:"status"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("auth: parse cancel response: %w (body: %s)", err, string(body))
+	}
+	// Status != 0 is OK here (e.g. nothing to cancel).
+	return nil
+}
+
+// GeneratePasscode starts the passcode login flow. The user must confirm
+// the returned passcode on their phone within RemainingSeconds.
+func (ac *AuthClient) GeneratePasscode() (*PasscodeGenerateResponse, error) {
+	body, err := ac.postJSON("passcodeLogin/generate", map[string]interface{}{
+		"email":    ac.Email,
+		"password": ac.Password,
+		"device": PasscodeDeviceInfo{
+			Name:      ac.DeviceName,
+			UUID:      ac.DeviceUUID,
+			OSVersion: ac.OSVersion,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("auth: generate passcode: %w", err)
+	}
+
+	var resp PasscodeGenerateResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("auth: parse generate response: %w (body: %s)", err, string(body))
+	}
+
+	if resp.Status != 0 {
+		return &resp, fmt.Errorf("auth: generate passcode failed with status %d (body: %s)", resp.Status, string(body))
+	}
+
+	return &resp, nil
+}
+
+// PollRegisterDevice makes a single poll to check if the user has confirmed the
+// passcode on their phone. Call this in a loop until status is 0 (success).
+// Set permanent=true to keep the device registered across logins.
+func (ac *AuthClient) PollRegisterDevice(passcode string, permanent bool) (*PasscodeRegisterResponse, error) {
+	body, err := ac.postJSON("passcodeLogin/registerDevice", map[string]interface{}{
+		"email":     ac.Email,
+		"password":  ac.Password,
+		"passcode":  passcode,
+		"permanent": permanent,
+		"device": PasscodeDeviceInfo{
+			UUID: ac.DeviceUUID,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("auth: poll register device: %w", err)
+	}
+
+	var resp PasscodeRegisterResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("auth: parse register response: %w (body: %s)", err, string(body))
+	}
+
+	if resp.Status != 0 {
+		return &resp, fmt.Errorf("auth: register device status %d (body: %s)", resp.Status, string(body))
+	}
+
+	return &resp, nil
+}
+
+// RefreshToken attempts to refresh an access token using the refresh token.
+func (ac *AuthClient) RefreshToken(refreshToken string) (*LoginResponse, error) {
+	body, err := ac.post("token_refresh.json", url.Values{
+		"refresh_token": {refreshToken},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("auth: refresh token: %w", err)
+	}
+
+	var resp LoginResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("auth: parse refresh response: %w (body: %s)", err, string(body))
+	}
+
+	if resp.Status != 0 {
+		return &resp, fmt.Errorf("auth: token refresh failed with status %d (body: %s)", resp.Status, string(body))
+	}
+
+	return &resp, nil
+}
+
 // RequestPasscode requests a device verification passcode be sent to the user's phone.
+// Deprecated: Uses old request_passcode.json endpoint which returns -400. Use GeneratePasscode instead.
 func (ac *AuthClient) RequestPasscode() ([]byte, error) {
 	return ac.post("request_passcode.json", nil)
 }
 
 // RegisterDevice submits the verification passcode to register this device.
+// Deprecated: Uses old register_device.json endpoint which returns -400. Use PollRegisterDevice instead.
 func (ac *AuthClient) RegisterDevice(passcode string, permanent bool) ([]byte, error) {
 	return ac.post("register_device.json", url.Values{
 		"passcode":  {passcode},

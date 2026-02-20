@@ -1,7 +1,9 @@
 package talk
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -27,6 +29,10 @@ type Client struct {
 	loginChannels []bson.Raw // raw channel data from LOGINLIST
 	Handlers      EventHandlers
 
+	// Stored credentials for re-login (populated by Login(), empty if LoginWithToken()).
+	email    string
+	password string
+
 	mu     sync.RWMutex
 	closed bool
 }
@@ -38,15 +44,29 @@ func NewClient() *Client {
 	}
 }
 
+// LoginOptions controls login behavior.
+type LoginOptions struct {
+	// Forced forces login even if another session exists.
+	// WARNING: each forced login consumes the device registration,
+	// requiring the full passcode re-confirmation flow.
+	Forced bool
+}
+
 // Login performs the full authentication flow: HTTP login → booking → checkin → LOGINLIST.
+// Uses Forced: false by default to avoid burning the device registration.
 func (c *Client) Login(email, password, deviceUUID, deviceName string) error {
+	return c.LoginWithOptions(email, password, deviceUUID, deviceName, LoginOptions{Forced: false})
+}
+
+// LoginWithOptions performs the full authentication flow with configurable options.
+func (c *Client) LoginWithOptions(email, password, deviceUUID, deviceName string, opts LoginOptions) error {
 	loginResp, err := auth.Login(auth.LoginRequest{
 		Email:      email,
 		Password:   password,
 		DeviceUUID: deviceUUID,
 		DeviceName: deviceName,
 		Agent:      c.Config.Agent,
-		Forced:     true,
+		Forced:     opts.Forced,
 	})
 	if err != nil {
 		return fmt.Errorf("talk: login: %w", err)
@@ -56,6 +76,8 @@ func (c *Client) Login(email, password, deviceUUID, deviceName string) error {
 	c.RefreshToken = loginResp.RefreshToken
 	c.UserID = loginResp.UserID
 	c.DeviceUUID = deviceUUID
+	c.email = email
+	c.password = password
 
 	return c.connect()
 }
@@ -272,6 +294,15 @@ func (c *Client) GetChannelMembers(channelID int64) ([]ChannelMember, error) {
 	return GetChannelMembers(session, channelID)
 }
 
+// GetMember returns a specific member from a channel by user ID.
+func (c *Client) GetMember(channelID int64, userID int64) (*ChannelMember, error) {
+	session := c.Session()
+	if session == nil {
+		return nil, fmt.Errorf("talk: not connected")
+	}
+	return GetMember(session, channelID, userID)
+}
+
 // SyncMessages retrieves message history.
 func (c *Client) SyncMessages(channelID, sinceLogID int64, count int) ([]Chatlog, error) {
 	session := c.Session()
@@ -288,6 +319,117 @@ func (c *Client) MarkRead(channelID, logID int64) error {
 		return fmt.Errorf("talk: not connected")
 	}
 	return MarkRead(session, channelID, logID)
+}
+
+// SendPhoto uploads a photo and sends it as a photo message to a channel.
+func (c *Client) SendPhoto(channelID int64, filename string, data io.Reader, width, height int) (*Chatlog, error) {
+	session := c.Session()
+	if session == nil {
+		return nil, fmt.Errorf("talk: not connected")
+	}
+
+	result, err := UploadImage(c.AccessToken, c.UserID, filename, data)
+	if err != nil {
+		return nil, fmt.Errorf("talk: upload photo: %w", err)
+	}
+
+	extra, err := json.Marshal(map[string]interface{}{
+		"path": result.Path,
+		"w":    width,
+		"h":    height,
+		"s":    result.Size,
+		"name": filename,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("talk: marshal photo extra: %w", err)
+	}
+
+	resp, err := session.Request("WRITE", bson.M{
+		"chatId": channelID,
+		"type":   ChatTypePhoto,
+		"msg":    "",
+		"extra":  string(extra),
+		"noSeen": true,
+		"msgId":  time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("talk: WRITE photo: %w", err)
+	}
+	if s := bodyStatus(resp.Body); s != 0 {
+		return nil, fmt.Errorf("talk: WRITE photo failed with status %d", s)
+	}
+
+	var cl Chatlog
+	if err := bson.Unmarshal(resp.Body, &cl); err != nil {
+		return nil, fmt.Errorf("talk: parse WRITE photo response: %w", err)
+	}
+	return &cl, nil
+}
+
+// SendFile uploads a file and sends it as a file message to a channel.
+func (c *Client) SendFile(channelID int64, filename string, data io.Reader, size int64) (*Chatlog, error) {
+	session := c.Session()
+	if session == nil {
+		return nil, fmt.Errorf("talk: not connected")
+	}
+
+	result, err := UploadFile(c.AccessToken, c.UserID, filename, data)
+	if err != nil {
+		return nil, fmt.Errorf("talk: upload file: %w", err)
+	}
+
+	extra, err := json.Marshal(map[string]interface{}{
+		"path": result.Path,
+		"name": filename,
+		"s":    size,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("talk: marshal file extra: %w", err)
+	}
+
+	resp, err := session.Request("WRITE", bson.M{
+		"chatId": channelID,
+		"type":   ChatTypeFile,
+		"msg":    "",
+		"extra":  string(extra),
+		"noSeen": true,
+		"msgId":  time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("talk: WRITE file: %w", err)
+	}
+	if s := bodyStatus(resp.Body); s != 0 {
+		return nil, fmt.Errorf("talk: WRITE file failed with status %d", s)
+	}
+
+	var cl Chatlog
+	if err := bson.Unmarshal(resp.Body, &cl); err != nil {
+		return nil, fmt.Errorf("talk: parse WRITE file response: %w", err)
+	}
+	return &cl, nil
+}
+
+// RefreshSession attempts to refresh the access token and reconnect.
+// Falls back to full re-login if token refresh fails.
+func (c *Client) RefreshSession() error {
+	if c.RefreshToken != "" {
+		ac := auth.NewAuthClient(c.email, c.password, c.DeviceUUID, "amso-client")
+		resp, err := ac.RefreshToken(c.RefreshToken)
+		if err == nil {
+			c.AccessToken = resp.AccessToken
+			if resp.RefreshToken != "" {
+				c.RefreshToken = resp.RefreshToken
+			}
+			return c.Reconnect()
+		}
+		log.Printf("talk: token refresh failed, attempting full re-login: %v", err)
+	}
+
+	if c.email != "" && c.password != "" {
+		return c.LoginWithOptions(c.email, c.password, c.DeviceUUID, "amso-client", LoginOptions{Forced: false})
+	}
+
+	return fmt.Errorf("talk: cannot refresh session: no refresh token or credentials available")
 }
 
 // Close shuts down the client and its LOCO session.
@@ -322,6 +464,12 @@ func (c *Client) handlePush(p *loco.Packet) {
 				}
 			}
 		}()
+	case "NOTIREAD", "DECUNREAD":
+		c.handleReadReceipt(p)
+	case "SETMST":
+		c.handleTyping(p)
+	case "DELETEMSG":
+		c.handleDeleteMessage(p)
 	default:
 		if c.Handlers.OnRaw != nil {
 			c.Handlers.OnRaw(p.Method, p.Body)
@@ -408,4 +556,78 @@ func (c *Client) handleKickout(p *loco.Packet) {
 	if c.Handlers.OnKick != nil {
 		c.Handlers.OnKick(KickEvent{Reason: data.Reason})
 	}
+}
+
+func (c *Client) handleReadReceipt(p *loco.Packet) {
+	if c.Handlers.OnReadReceipt == nil {
+		return
+	}
+
+	var data struct {
+		ChatID    int64 `bson:"chatId"`
+		UserID    int64 `bson:"userId"`
+		Watermark int64 `bson:"watermark"`
+	}
+	if err := bson.Unmarshal(p.Body, &data); err != nil {
+		log.Printf("talk: failed to parse %s push: %v", p.Method, err)
+		return
+	}
+
+	c.Handlers.OnReadReceipt(ReadReceiptEvent{
+		ChannelID: data.ChatID,
+		UserID:    data.UserID,
+		Watermark: data.Watermark,
+	})
+}
+
+func (c *Client) handleTyping(p *loco.Packet) {
+	if c.Handlers.OnTyping == nil {
+		return
+	}
+
+	var data struct {
+		ChatID int64 `bson:"chatId"`
+		UserID int64 `bson:"authorId"`
+	}
+	if err := bson.Unmarshal(p.Body, &data); err != nil {
+		log.Printf("talk: failed to parse typing push: %v", err)
+		return
+	}
+
+	c.Handlers.OnTyping(TypingEvent{
+		ChannelID: data.ChatID,
+		UserID:    data.UserID,
+	})
+}
+
+func (c *Client) handleDeleteMessage(p *loco.Packet) {
+	if c.Handlers.OnMessageDelete == nil {
+		return
+	}
+
+	var data struct {
+		ChatID int64 `bson:"chatId"`
+		LogID  int64 `bson:"logId"`
+	}
+	if err := bson.Unmarshal(p.Body, &data); err != nil {
+		log.Printf("talk: failed to parse DELETEMSG push: %v", err)
+		return
+	}
+
+	c.Handlers.OnMessageDelete(MessageDeleteEvent{
+		ChannelID: data.ChatID,
+		LogID:     data.LogID,
+	})
+}
+
+// SendTyping sends a typing indicator to a channel (fire-and-forget).
+func (c *Client) SendTyping(channelID int64) error {
+	session := c.Session()
+	if session == nil {
+		return fmt.Errorf("talk: not connected")
+	}
+	return session.Send("SETMST", bson.M{
+		"chatId": channelID,
+		"t":      1,
+	})
 }

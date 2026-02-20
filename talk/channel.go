@@ -28,9 +28,13 @@ type ChannelInfo struct {
 
 // ChannelMember represents a member in a channel.
 type ChannelMember struct {
-	UserID    int64  `bson:"userId"`
-	Nickname  string `bson:"nickName"`
-	ProfileURL string `bson:"profileImageUrl"`
+	UserID             int64  `bson:"userId"`
+	Nickname           string `bson:"nickName"`
+	ProfileURL         string `bson:"profileImageUrl"`
+	FullProfileURL     string `bson:"fullProfileImageUrl,omitempty"`
+	OriginalProfileURL string `bson:"originalProfileImageUrl,omitempty"`
+	StatusMessage      string `bson:"statusMessage,omitempty"`
+	AccountID          int64  `bson:"accountId,omitempty"`
 }
 
 // parseChannelDatas parses raw BSON channel data (from LOGINLIST chatDatas or LCHATLIST).
@@ -163,6 +167,20 @@ func SyncMessages(session *loco.Session, channelID, sinceLogID int64, count int)
 	}
 
 	return logs, nil
+}
+
+// GetMember retrieves a specific member from a channel by user ID.
+func GetMember(session *loco.Session, channelID int64, userID int64) (*ChannelMember, error) {
+	members, err := GetChannelMembers(session, channelID)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range members {
+		if m.UserID == userID {
+			return &m, nil
+		}
+	}
+	return nil, fmt.Errorf("talk: member %d not found in channel %d", userID, channelID)
 }
 
 // MarkRead marks messages as read in a channel via NOTIREAD.

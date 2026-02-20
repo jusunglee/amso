@@ -1,0 +1,411 @@
+package talk
+
+import (
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
+
+	"github.com/jusunglee/amso/auth"
+	"github.com/jusunglee/amso/loco"
+	"github.com/jusunglee/amso/network"
+)
+
+// Client is the high-level KakaoTalk client. It manages authentication,
+// the LOCO session, event dispatch, and channel operations.
+type Client struct {
+	Config *network.Config
+
+	AccessToken  string
+	RefreshToken string
+	UserID       int64
+	DeviceUUID   string
+
+	session       *loco.Session
+	loginChannels []bson.Raw // raw channel data from LOGINLIST
+	Handlers      EventHandlers
+
+	mu     sync.RWMutex
+	closed bool
+}
+
+// NewClient creates a new Client with default config.
+func NewClient() *Client {
+	return &Client{
+		Config: network.DefaultConfig(),
+	}
+}
+
+// Login performs the full authentication flow: HTTP login → booking → checkin → LOGINLIST.
+func (c *Client) Login(email, password, deviceUUID, deviceName string) error {
+	loginResp, err := auth.Login(auth.LoginRequest{
+		Email:      email,
+		Password:   password,
+		DeviceUUID: deviceUUID,
+		DeviceName: deviceName,
+		Agent:      c.Config.Agent,
+		Forced:     true,
+	})
+	if err != nil {
+		return fmt.Errorf("talk: login: %w", err)
+	}
+
+	c.AccessToken = loginResp.AccessToken
+	c.RefreshToken = loginResp.RefreshToken
+	c.UserID = loginResp.UserID
+	c.DeviceUUID = deviceUUID
+
+	return c.connect()
+}
+
+// LoginWithToken connects using a previously obtained access token.
+func (c *Client) LoginWithToken(accessToken string, userID int64, deviceUUID string) error {
+	c.AccessToken = accessToken
+	c.UserID = userID
+	c.DeviceUUID = deviceUUID
+	return c.connect()
+}
+
+func (c *Client) connect() error {
+	session, loginResult, err := network.Connect(c.AccessToken, c.UserID, c.DeviceUUID, c.Config)
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	c.session = session
+	c.closed = false
+	c.mu.Unlock()
+
+	session.OnPush = c.handlePush
+
+	// Parse channels from LOGINLIST response.
+	if loginResult != nil {
+		c.mu.Lock()
+		c.loginChannels = loginResult.Channels
+		c.mu.Unlock()
+	}
+	return nil
+}
+
+// Reconnect tears down the current session and establishes a new one.
+func (c *Client) Reconnect() error {
+	c.mu.Lock()
+	if c.session != nil {
+		c.session.Close()
+	}
+	c.mu.Unlock()
+
+	// Brief pause before reconnecting.
+	time.Sleep(1 * time.Second)
+	return c.connect()
+}
+
+// Session returns the underlying LOCO session for direct protocol access.
+func (c *Client) Session() *loco.Session {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.session
+}
+
+// bodyStatus extracts the status field from a LOCO response BSON body.
+// LOCO uses the BSON body status (int32), not the packet header StatusCode (uint16).
+func bodyStatus(body bson.Raw) int32 {
+	var s struct {
+		Status int32 `bson:"status"`
+	}
+	bson.Unmarshal(body, &s)
+	return s.Status
+}
+
+// SendText sends a text message to a channel.
+func (c *Client) SendText(channelID int64, text string) (*Chatlog, error) {
+	session := c.Session()
+	if session == nil {
+		return nil, fmt.Errorf("talk: not connected")
+	}
+
+	resp, err := session.Request("WRITE", bson.M{
+		"chatId": channelID,
+		"type":   ChatTypeText,
+		"msg":    text,
+		"noSeen": true,
+		"msgId":  time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("talk: WRITE: %w", err)
+	}
+
+	if s := bodyStatus(resp.Body); s != 0 {
+		return nil, fmt.Errorf("talk: WRITE failed with status %d", s)
+	}
+
+	var cl Chatlog
+	if err := bson.Unmarshal(resp.Body, &cl); err != nil {
+		return nil, fmt.Errorf("talk: parse WRITE response: %w", err)
+	}
+
+	return &cl, nil
+}
+
+// SendReply sends a reply to a specific message in a channel.
+func (c *Client) SendReply(channelID int64, text string, replyToLogID int64) (*Chatlog, error) {
+	session := c.Session()
+	if session == nil {
+		return nil, fmt.Errorf("talk: not connected")
+	}
+
+	attachmentData, err := bson.Marshal(bson.M{
+		"src_logId": replyToLogID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("talk: marshal reply attachment: %w", err)
+	}
+
+	resp, err := session.Request("WRITE", bson.M{
+		"chatId":    channelID,
+		"type":      ChatTypeReply,
+		"msg":       text,
+		"noSeen":    true,
+		"msgId":     time.Now().UnixMilli(),
+		"extra":     string(attachmentData),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("talk: WRITE reply: %w", err)
+	}
+
+	if s := bodyStatus(resp.Body); s != 0 {
+		return nil, fmt.Errorf("talk: WRITE reply failed with status %d", s)
+	}
+
+	var cl Chatlog
+	if err := bson.Unmarshal(resp.Body, &cl); err != nil {
+		return nil, fmt.Errorf("talk: parse WRITE reply response: %w", err)
+	}
+
+	return &cl, nil
+}
+
+// ForwardMessage forwards a message to another channel.
+func (c *Client) ForwardMessage(fromChannelID, toChannelID, logID int64) (*Chatlog, error) {
+	session := c.Session()
+	if session == nil {
+		return nil, fmt.Errorf("talk: not connected")
+	}
+
+	resp, err := session.Request("FORWARD", bson.M{
+		"chatId":    toChannelID,
+		"srcChatId": fromChannelID,
+		"srcLogId":  logID,
+		"msgId":     time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("talk: FORWARD: %w", err)
+	}
+
+	if s := bodyStatus(resp.Body); s != 0 {
+		return nil, fmt.Errorf("talk: FORWARD failed with status %d", s)
+	}
+
+	var cl Chatlog
+	if err := bson.Unmarshal(resp.Body, &cl); err != nil {
+		return nil, fmt.Errorf("talk: parse FORWARD response: %w", err)
+	}
+
+	return &cl, nil
+}
+
+// DeleteMessage deletes a message from a channel via DELETEMSG.
+func (c *Client) DeleteMessage(channelID, logID int64) error {
+	session := c.Session()
+	if session == nil {
+		return fmt.Errorf("talk: not connected")
+	}
+
+	resp, err := session.Request("DELETEMSG", bson.M{
+		"chatId": channelID,
+		"logId":  logID,
+	})
+	if err != nil {
+		return fmt.Errorf("talk: DELETEMSG: %w", err)
+	}
+	if s := bodyStatus(resp.Body); s != 0 {
+		return fmt.Errorf("talk: DELETEMSG failed with status %d", s)
+	}
+	return nil
+}
+
+// ListChannels returns the channel list, using the LOGINLIST data if available.
+func (c *Client) ListChannels() ([]ChannelInfo, error) {
+	c.mu.RLock()
+	raw := c.loginChannels
+	c.mu.RUnlock()
+
+	if len(raw) > 0 {
+		return parseChannelDatas(raw)
+	}
+
+	session := c.Session()
+	if session == nil {
+		return nil, fmt.Errorf("talk: not connected")
+	}
+	return ListChannels(session, 0, 100)
+}
+
+// GetChannelInfo returns info for a specific channel.
+func (c *Client) GetChannelInfo(channelID int64) (*ChannelInfo, error) {
+	session := c.Session()
+	if session == nil {
+		return nil, fmt.Errorf("talk: not connected")
+	}
+	return GetChannelInfo(session, channelID)
+}
+
+// GetChannelMembers returns the members of a channel.
+func (c *Client) GetChannelMembers(channelID int64) ([]ChannelMember, error) {
+	session := c.Session()
+	if session == nil {
+		return nil, fmt.Errorf("talk: not connected")
+	}
+	return GetChannelMembers(session, channelID)
+}
+
+// SyncMessages retrieves message history.
+func (c *Client) SyncMessages(channelID, sinceLogID int64, count int) ([]Chatlog, error) {
+	session := c.Session()
+	if session == nil {
+		return nil, fmt.Errorf("talk: not connected")
+	}
+	return SyncMessages(session, channelID, sinceLogID, count)
+}
+
+// MarkRead marks messages as read in a channel.
+func (c *Client) MarkRead(channelID, logID int64) error {
+	session := c.Session()
+	if session == nil {
+		return fmt.Errorf("talk: not connected")
+	}
+	return MarkRead(session, channelID, logID)
+}
+
+// Close shuts down the client and its LOCO session.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.closed = true
+	if c.session != nil {
+		return c.session.Close()
+	}
+	return nil
+}
+
+func (c *Client) handlePush(p *loco.Packet) {
+	switch p.Method {
+	case "MSG":
+		c.handleMessage(p)
+	case "NEWMEM":
+		c.handleNewMember(p)
+	case "DELMEM":
+		c.handleDelMember(p)
+	case "KICKOUT":
+		c.handleKickout(p)
+	case "CHANGESVR":
+		go func() {
+			log.Printf("talk: server change requested, reconnecting...")
+			if err := c.Reconnect(); err != nil {
+				log.Printf("talk: reconnect after CHANGESVR failed: %v", err)
+				if c.Handlers.OnDisconnect != nil {
+					c.Handlers.OnDisconnect(DisconnectEvent{Err: err})
+				}
+			}
+		}()
+	default:
+		if c.Handlers.OnRaw != nil {
+			c.Handlers.OnRaw(p.Method, p.Body)
+		}
+	}
+}
+
+func (c *Client) handleMessage(p *loco.Packet) {
+	if c.Handlers.OnMessage == nil {
+		return
+	}
+
+	var data struct {
+		ChatLog bson.Raw `bson:"chatLog"`
+		ChatID  int64    `bson:"chatId"`
+	}
+	if err := bson.Unmarshal(p.Body, &data); err != nil {
+		log.Printf("talk: failed to parse MSG push: %v", err)
+		return
+	}
+
+	var cl Chatlog
+	if err := bson.Unmarshal(data.ChatLog, &cl); err != nil {
+		log.Printf("talk: failed to parse chatlog in MSG: %v", err)
+		return
+	}
+
+	if cl.ChatID == 0 {
+		cl.ChatID = data.ChatID
+	}
+
+	c.Handlers.OnMessage(MessageEvent{
+		ChannelID: cl.ChatID,
+		Log:       cl,
+	})
+}
+
+func (c *Client) handleNewMember(p *loco.Packet) {
+	if c.Handlers.OnChannelJoin == nil {
+		return
+	}
+
+	var data struct {
+		ChatID int64 `bson:"chatId"`
+		UserID int64 `bson:"authorId"`
+	}
+	if err := bson.Unmarshal(p.Body, &data); err != nil {
+		log.Printf("talk: failed to parse NEWMEM push: %v", err)
+		return
+	}
+
+	c.Handlers.OnChannelJoin(ChannelJoinEvent{
+		ChannelID: data.ChatID,
+		UserID:    data.UserID,
+	})
+}
+
+func (c *Client) handleDelMember(p *loco.Packet) {
+	if c.Handlers.OnChannelLeave == nil {
+		return
+	}
+
+	var data struct {
+		ChatID int64 `bson:"chatId"`
+		UserID int64 `bson:"authorId"`
+	}
+	if err := bson.Unmarshal(p.Body, &data); err != nil {
+		log.Printf("talk: failed to parse DELMEM push: %v", err)
+		return
+	}
+
+	c.Handlers.OnChannelLeave(ChannelLeaveEvent{
+		ChannelID: data.ChatID,
+		UserID:    data.UserID,
+	})
+}
+
+func (c *Client) handleKickout(p *loco.Packet) {
+	var data struct {
+		Reason int `bson:"reason"`
+	}
+	bson.Unmarshal(p.Body, &data)
+
+	if c.Handlers.OnKick != nil {
+		c.Handlers.OnKick(KickEvent{Reason: data.Reason})
+	}
+}

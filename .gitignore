@@ -1,0 +1,9 @@
+.env
+*.exe
+/test-flow
+/try-login
+scripts/
+cmd/debug-auth/
+cmd/trigger-login/
+cmd/register-device/
+cmd/try-connect/
